@@ -1,5 +1,7 @@
-import json
-import os
+"""Random greeting in a big block font (falls back to plain text if it won't fit)."""
+from __future__ import annotations
+
+import getpass
 import random
 from datetime import datetime
 from typing import Callable
@@ -8,13 +10,12 @@ from rich.console import Group
 from rich.padding import Padding
 from rich.text import Text
 
-from . import DashboardModule
-from .context import Frame
-from .weather_display import describe
+from dashlib import BlockFont, Frame, Module, app_dir
+from dashlib.blockfont import load_font_file
+from dashlib.weather import describe, service
 
-MODULE = DashboardModule("welcome", "Welcome banner", row=2, column=5)
-
-_DEFAULT_GLYPHS = {
+# Built-in 5-row block font (used when no custom font file is available).
+BIG = {
     "A": [" ███ ", "█   █", "█████", "█   █", "█   █"],
     "B": ["████ ", "█   █", "████ ", "█   █", "████ "],
     "C": [" ████", "█    ", "█    ", "█    ", " ████"],
@@ -50,52 +51,8 @@ _DEFAULT_GLYPHS = {
 }
 
 
-class BlockFont:
-    def __init__(self, glyphs: dict, gap: int = 1) -> None:
-        height = max(len(rows) for rows in glyphs.values())
-        space_width = max(3, height // 2)
-        self.glyphs: dict[str, list[str]] = {}
-        for char, rows in glyphs.items():
-            rows = list(rows) + [""] * (height - len(rows))
-            width = max(len(row.rstrip()) for row in rows) or space_width
-            self.glyphs[char] = [row[:width].ljust(width) for row in rows]
-        self.glyphs.setdefault(" ", [" " * space_width] * height)
-        self.height = height
-        self.gap = gap
-        self.cache: dict[str, str] = {}
-
-    def _glyph(self, char: str) -> list[str] | None:
-        for candidate in (char, char.upper(), char.lower()):
-            if candidate in self.glyphs:
-                return self.glyphs[candidate]
-        return None
-
-    def can_render(self, text: str) -> bool:
-        return all(self._glyph(char) is not None for char in text)
-
-    def render(self, text: str) -> str:
-        if text in self.cache:
-            return self.cache[text]
-        blank = [" " * 3] * self.height
-        glyphs = [self._glyph(char) or blank for char in text]
-        separator = " " * self.gap
-        rows = [
-            separator.join(glyph[row] for glyph in glyphs)
-            for row in range(self.height)
-        ]
-        while rows and not rows[0].strip():
-            rows.pop(0)
-        while rows and not rows[-1].strip():
-            rows.pop()
-        result = "\n".join(rows)
-        self.cache[text] = result
-        return result
-
-    def width(self, text: str) -> int:
-        return max((len(row) for row in self.render(text).split("\n")), default=0)
-
-
-def _period(hour: int) -> str:
+def day_period(hour: int) -> str:
+    """Name of the time-of-day bucket used to choose greetings."""
     if 5 <= hour < 12:
         return "morning"
     if 12 <= hour < 16:
@@ -105,79 +62,81 @@ def _period(hour: int) -> str:
     return "night"
 
 
-class Welcome:
-    """Owns greeting selection, font loading, and welcome-banner rendering."""
+class Greeter:
+    """Picks a random greeting and keeps it until it should change.
 
-    def __init__(
-        self,
-        font_file: str | None,
-        font_gap: int,
-        greetings: dict,
-        user_name: str,
-        show_summary: bool,
-    ) -> None:
-        self.font, self.font_note = self._load_font(font_file, font_gap)
-        self.greetings = greetings
-        self.user_name = user_name
-        self.show_summary = show_summary
+    A new message is chosen when the time of day changes, or when the current
+    one no longer fits (for example after the terminal is resized).
+    """
+
+    def __init__(self) -> None:
         self.period: str | None = None
         self.text = ""
 
-    @staticmethod
-    def _load_font(font_file: str | None, gap: int) -> tuple[BlockFont, str]:
-        try:
-            if font_file:
-                here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-                path = next(
-                    (
-                        candidate
-                        for candidate in (
-                            os.path.join(here, font_file),
-                            os.path.join(here, "dbfonts", os.path.basename(font_file)),
-                            font_file,
-                        )
-                        if os.path.isfile(candidate)
-                    ),
-                    None,
-                )
-                if path is None:
-                    return BlockFont(_DEFAULT_GLYPHS, 1), f"font file '{font_file}' not found"
-                with open(path, encoding="utf-8") as file:
-                    return BlockFont(json.load(file), gap), ""
-        except (OSError, ValueError, TypeError, AttributeError):
-            return BlockFont(_DEFAULT_GLYPHS, 1), "custom font could not be loaded"
-        return BlockFont(_DEFAULT_GLYPHS, 1), ""
-
-    def _greeting(self, now: datetime, fits: Callable[[str], bool]) -> str:
-        period = _period(now.hour)
-        options = [message.format(name=self.user_name) for message in self.greetings[period]]
-        fitting = [message for message in options if fits(message)]
-        if self.period != period or (fitting and self.text not in fitting):
+    def pick(self, now: datetime, options: list[str], period: str, fits: Callable[[str], bool]) -> str:
+        fitting = [m for m in options if fits(m)]
+        should_refresh = self.period != period or (fitting and self.text not in fitting)
+        if should_refresh:
             self.period = period
             choices = fitting or options
             alternatives = [choice for choice in choices if choice != self.text]
             self.text = random.choice(alternatives or choices)
         return self.text
 
+
+class Welcome(Module):
+    name = "welcome"
+    title = "Welcome banner"
+    description = "Time-of-day greeting in a big font (greetings, font and name come from the config)."
+    sizes = {"short": (2, 10), "normal": (3, 10), "tall": (4, 10), "half": (3, 6)}
+    default_size = "normal"
+    config_section = "appearance"
+    defaults = {"show_welcome_summary": False, "font_file": "", "custom_font_gap": 0}
+
+    def __init__(self, options=None, config=None) -> None:
+        super().__init__(options, config)
+        self.greeter = Greeter()
+        self.font, self.note = self._load_font()
+
+    def _load_font(self) -> tuple[BlockFont, str]:
+        font_file = self.option("font_file") or None
+        if not font_file:
+            return BlockFont(BIG, 1), ""
+        try:
+            return load_font_file(font_file, app_dir(), int(self.option("custom_font_gap", 0))), ""
+        except FileNotFoundError:
+            return BlockFont(BIG, 1), f"font file '{font_file}' not found"
+        except (OSError, ValueError, TypeError, AttributeError):
+            return BlockFont(BIG, 1), "custom font could not be loaded"
+
+    def _name(self) -> str:
+        name = str(self.config.get("name") or "").strip()
+        return name if name and name.upper() != "USER" else getpass.getuser().title()
+
     def render(self, frame: Frame):
-        available = frame.geo.left_inner
+        weather = service()
+        weather.poll()
+        inner_w = frame.width - 2 * frame.pad
+        want_summary = bool(self.option("show_welcome_summary"))
+        # rows left for the art after top/bottom padding and the optional summary
+        art_rows = frame.height - (2 if frame.height >= 5 else 0) - (2 if want_summary else 0)
 
         def fits(text: str) -> bool:
-            return self.font.can_render(text) and self.font.width(text) <= available
+            return (self.font.can_render(text) and self.font.width(text) <= inner_w
+                    and self.font.rows(text) <= art_rows)
 
-        message = self._greeting(frame.now, fits)
-        art = self.font.render(message) if fits(message) else message
-        summary = ""
-        if self.show_summary and frame.weather:
-            current = frame.weather.current
-            label, _ = describe(current["weather_code"])
-            summary = (
-                f"It's {round(current['temperature_2m'])}° and "
-                f"{label.lower()} in {frame.location}."
-            )
-        height = art.count("\n") + 5
-        rendered = Padding(
-            Group(Text(art, style="bold"), Text(""), Text(summary)),
-            (1, frame.padding),
-        )
-        return rendered, height
+        greetings = (frame.config.get("greetings") or {})
+        period = day_period(frame.now.hour)
+        options = [m.format(name=self._name()) for m in greetings.get(period, ["Hello, {name}"])]
+        text = self.greeter.pick(frame.now, options, period, fits)
+        art = self.font.render(text) if fits(text) else text
+
+        parts = [Text(art, style="bold", no_wrap=True, overflow="crop")]
+        data = weather.latest
+        if want_summary and data:
+            cur = data.current
+            label, _ = describe(cur["weather_code"])
+            parts += [Text(""), Text(f"It's {round(cur['temperature_2m'])}° and {label.lower()} in {weather.location_name}.")]
+        if self.note and frame.height >= art.count("\n") + 3:
+            parts += [Text(""), Text(self.note, style="dim")]
+        return Padding(Group(*parts), (1 if frame.height >= 5 else 0, frame.pad))
