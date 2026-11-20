@@ -33,7 +33,7 @@ from modules.weather_display import SNOW_CODES
 CONFIG_FILE = "startup.json"
 
 DEFAULT_CONFIG = {
-    "version": "v0.2.1",
+    "version": "v0.2.2",
     "name": "USER",
     "location": {
         "name": "New York City, NY",
