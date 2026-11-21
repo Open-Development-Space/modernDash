@@ -26,7 +26,7 @@ class Aquarium(Module):
     name = "aquarium"
     title = "Aquarium"
     description = "Animated fish tank (option: wave, the surface character)."
-    sizes = {"small": (3, 5), "medium": (5, 7), "large": (7, 10), "wide": (4, 14), "full": (10, 14)}
+    sizes = {"small": (3, 5), "medium": (5, 7), "large": (7, 10), "tall": (8, 10), "wide": (4, 14), "full": (10, 14)}
     default_size = "large"
     config_section = "aquarium"
     defaults = {"wave": " "}

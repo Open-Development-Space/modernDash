@@ -36,8 +36,8 @@ def venv_python() -> str:
 
 
 def bin_dir() -> str:
-    if IS_WIN:
-        return os.path.join(os.environ.get("LOCALAPPDATA") or os.path.join(HOME, "AppData", "Local"), "modernDash", "bin")
+    if IS_WIN:  # under the home folder: %LOCALAPPDATA% is redirected for Microsoft Store Python
+        return os.path.join(HOME, ".moderndash", "bin")
     return os.path.join(HOME, ".local", "bin")
 
 
@@ -203,29 +203,79 @@ def _on_path(directory: str) -> bool:
     return os.path.normcase(directory) in [os.path.normcase(p) for p in os.environ.get("PATH", "").split(os.pathsep)]
 
 
-def _windows_path_edit(directory: str, add: bool) -> None:
+def _windows_user_path() -> str | None:
+    """The user PATH as a brand-new process would see it (None if it can't be read)."""
+    try:
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", "[Environment]::GetEnvironmentVariable('Path','User')"],
+            capture_output=True, text=True, timeout=30)
+        return out.stdout.strip() if out.returncode == 0 else None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def _path_contains(path_value: str | None, directory: str) -> bool:
+    entries = [os.path.normcase(p.rstrip("\\")) for p in (path_value or "").split(";") if p]
+    return os.path.normcase(directory.rstrip("\\")) in entries
+
+
+def _windows_path_edit(directory: str, add: bool) -> bool:
+    """Add/remove ``directory`` on the user PATH. Returns True if the change is visible."""
     import ctypes
-    import winreg
-    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment", 0, winreg.KEY_READ | winreg.KEY_WRITE) as key:
-        try:
-            current, kind = winreg.QueryValueEx(key, "Path")
-        except FileNotFoundError:
-            current, kind = "", winreg.REG_EXPAND_SZ
-        parts = [p for p in current.split(";") if p]
-        same = [os.path.normcase(p) for p in parts]
-        if add and os.path.normcase(directory) not in same:
-            parts.append(directory)
-        elif not add:
-            parts = [p for p in parts if os.path.normcase(p) != os.path.normcase(directory)]
-        winreg.SetValueEx(key, "Path", 0, kind, ";".join(parts))
-    ctypes.windll.user32.SendMessageTimeoutW(0xFFFF, 0x1A, 0, "Environment", 2, 5000, None)
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment", 0, winreg.KEY_READ | winreg.KEY_WRITE) as key:
+            try:
+                current, kind = winreg.QueryValueEx(key, "Path")
+            except FileNotFoundError:
+                current, kind = "", winreg.REG_EXPAND_SZ
+            parts = [p for p in current.split(";") if p]
+            parts = [p for p in parts if os.path.normcase(p.rstrip("\\")) != os.path.normcase(directory.rstrip("\\"))]
+            if add:
+                parts.append(directory)
+            winreg.SetValueEx(key, "Path", 0, kind, ";".join(parts))
+        ctypes.windll.user32.SendMessageTimeoutW(0xFFFF, 0x1A, 0, "Environment", 2, 5000, None)
+    except OSError:
+        pass
+    seen = _windows_user_path()
+    if seen is None or _path_contains(seen, directory) == add:
+        return True
+    # The registry write did not take effect (sandboxed Python): let PowerShell do it.
+    script = (
+        "$d=$env:MD_DIR; $p=[Environment]::GetEnvironmentVariable('Path','User'); "
+        "$parts=@(); if($p){$parts=@($p -split ';' | Where-Object { $_ -and $_.TrimEnd('\\') -ine $d.TrimEnd('\\') })}; "
+        + ("$parts += $d; " if add else "")
+        + "[Environment]::SetEnvironmentVariable('Path', ($parts -join ';'), 'User')"
+    )
+    try:
+        subprocess.run(["powershell", "-NoProfile", "-Command", script],
+                       env={**os.environ, "MD_DIR": directory}, check=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return _path_contains(_windows_user_path(), directory) == add
+
+
+def _win_copy(src: str, dst: str) -> None:
+    """Copy a file with cmd.exe, which (unlike Store Python) is not sandboxed."""
+    subprocess.run(["cmd", "/c", "mkdir", os.path.dirname(dst)], capture_output=True)
+    subprocess.run(["cmd", "/c", "copy", "/y", src, dst], check=True, capture_output=True)
+
+
+def _win_delete(path: str) -> bool:
+    exists = subprocess.run(["cmd", "/c", "if", "exist", path, "exit", "0"], capture_output=True).returncode == 0
+    subprocess.run(["cmd", "/c", "del", "/f", "/q", path], capture_output=True)
+    return exists
 
 
 def ensure_on_path(assume_yes: bool) -> None:
     directory = bin_dir()
     if IS_WIN:
-        _windows_path_edit(directory, add=True)
-        say("Added the command folder to your user PATH (open a new terminal to use it).")
+        if _windows_path_edit(directory, add=True):
+            say("Added the command folder to your user PATH.")
+        else:
+            say(f"Could not update PATH automatically. Add this folder to your PATH yourself:\n  {directory}")
+        say("Terminals that were already open will not see it: open a new window, or in this one run:\n"
+            f"  $env:Path += ';{directory}'")
         return
     if _on_path(directory):
         return
@@ -242,10 +292,8 @@ def ensure_on_path(assume_yes: bool) -> None:
 
 def remove_from_path() -> None:
     if IS_WIN:
-        try:
-            _windows_path_edit(bin_dir(), add=False)
-        except Exception as error:  # registry unavailable; nothing else we can do
-            say(f"Could not edit PATH: {error}")
+        if not _windows_path_edit(bin_dir(), add=False):
+            say("Could not remove the PATH entry automatically; remove it in Environment Variables.")
         return
     for rc in _unix_rc_files(False) + [os.path.join(HOME, ".profile")]:
         _drop_block(rc, PATH_START, PATH_END)
@@ -282,9 +330,11 @@ def startup_enable(mode: str) -> None:
         raise SystemExit("Mode must be 'login' or 'shell'.")
     if IS_WIN:
         path = windows_startup_file()
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w", encoding="utf-8", newline="") as f:
+        os.makedirs(data_dir(), exist_ok=True)
+        staged = os.path.join(data_dir(), "startup.cmd")
+        with open(staged, "w", encoding="utf-8", newline="") as f:
             f.write(f'@echo off\r\nstart "modernDash" cmd /k ""{launcher}" run"\r\n')
+        _win_copy(staged, path)
     elif IS_MAC:
         os.makedirs(data_dir(), exist_ok=True)
         command = os.path.join(data_dir(), "startup.command")
@@ -312,8 +362,11 @@ def startup_enable(mode: str) -> None:
 
 def startup_disable() -> list[str]:
     removed: list[str] = []
+    if IS_WIN and _win_delete(windows_startup_file()):
+        removed.append(windows_startup_file())
     for path in (windows_startup_file(), mac_agent_file(), linux_autostart_file(),
-                 os.path.join(data_dir(), "startup.sh"), os.path.join(data_dir(), "startup.command")):
+                 os.path.join(data_dir(), "startup.sh"), os.path.join(data_dir(), "startup.command"),
+                 os.path.join(data_dir(), "startup.cmd")):
         if os.path.isfile(path):
             os.remove(path)
             removed.append(path)
@@ -326,7 +379,8 @@ def startup_disable() -> list[str]:
 def startup_status() -> None:
     login = windows_startup_file() if IS_WIN else mac_agent_file() if IS_MAC else linux_autostart_file()
     say(f"command installed : {'yes' if os.path.isfile(launcher_path()) else 'no'} ({launcher_path()})")
-    say(f"on PATH           : {'yes' if IS_WIN or _on_path(bin_dir()) else 'no'}")
+    on_path = _path_contains(_windows_user_path(), bin_dir()) if IS_WIN else _on_path(bin_dir())
+    say(f"on PATH           : {'yes' if on_path else 'no'}")
     say(f"run at login      : {'on' if os.path.isfile(login) else 'off'}")
     shells = [p for p in _shell_profiles(create=False) if _has_block(p, BLOCK_START)]
     say(f"run in new terminal: {'on (' + ', '.join(shells) + ')' if shells else 'off'}")

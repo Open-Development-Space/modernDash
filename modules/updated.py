@@ -13,7 +13,7 @@ class Updated(Module):
     name = "updated"
     title = "Update footer"
     description = "When weather was last refreshed, and the dashboard version."
-    sizes = {"slim": (1, 6), "full": (1, 14)}
+    sizes = {"slim": (1, 6), "side": (1, 4), "full": (1, 14)}
     default_size = "full"
 
     def render(self, frame: Frame):
@@ -28,4 +28,4 @@ class Updated(Module):
         grid = Table.grid(expand=True)
         grid.add_column(justify="right")
         grid.add_row(Text(updated, style="dim"))
-        return Padding(grid, (0, 1, 0, frame.pad))
+        return Padding(grid, (max(0, frame.height - 1), 1, 0, frame.pad))
